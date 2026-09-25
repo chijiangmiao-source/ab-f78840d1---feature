@@ -3,11 +3,12 @@
 
 // 一次性验收服务 verify：
 //   1. 复核合法链的逐跳证据（每跳签名、规范载荷摘要、收紧约束、准许结论）；
-//   2. 复核越权链的拒绝（浮标未获上游允许 / 采样量超限 / 约束放宽），定位跳与字段；
-//   3. 复核篡改签名 / 改写载荷的拒绝（BAD_SIGNATURE）；
-//   4. 复核结构性错误（重复键、键序不规范、不安全 / 越界整数、非有限数、链首非根公钥）；
-//   5. 运行相关代码测试（node --test tests/）与页面构建检查；
-//   6. 启动本机服务做健康地址 API/HTTP 冒烟；GATEWAY_URL 存在时再冒烟对端。
+//   2. 复核乱序委托集合授权求解（状态图 / 回环支配 / 稳定选路 / 不可达报告）；
+//   3. 复核越权链的拒绝（浮标未获上游允许 / 采样量超限 / 约束放宽），定位跳与字段；
+//   4. 复核篡改签名 / 改写载荷的拒绝（BAD_SIGNATURE）；
+//   5. 复核结构性错误（重复键、键序不规范、不安全 / 越界整数、非有限数、链首非根公钥）；
+//   6. 运行相关代码测试（node --test tests/）与页面构建检查；
+//   7. 启动本机服务做健康地址 API/HTTP 冒烟；GATEWAY_URL 存在时再冒烟对端。
 //
 // 执行完毕即退出：0 全部通过，1 存在验收失败，2 执行异常。
 
@@ -17,6 +18,7 @@ import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import crypto from 'node:crypto';
 import { verifyChain } from '../src/chain.js';
+import { authorizeSet } from '../src/graph.js';
 import { canonicalize, parseCanonical } from '../src/canonical.js';
 import {
   generateKeyPair,
@@ -66,7 +68,7 @@ function resign(value, privateJwk) {
 
 // ---------- 1) 合法链逐跳证据 ----------
 function sectionValidChain() {
-  console.log('\n[1/6] 合法链逐跳证据复核');
+  console.log('\n[1/7] 合法链逐跳证据复核');
   const root = generateKeyPair();
   const a = generateKeyPair();
   const b = generateKeyPair();
@@ -117,11 +119,136 @@ function sectionValidChain() {
     e.verdict.allow === true && e.verdict.buoy === 'buoy-01' && e.verdict.samples === 40);
 }
 
-// ---------- 2) 越权链 ----------
-function sectionOverPrivileged() {
-  console.log('\n[2/6] 越权链拒绝复核');
+// ---------- 2) 乱序委托集合授权（状态图 / 回环 / 支配 / 稳定选路 / 不可达） ----------
+function digestOfText(text) {
+  const { sig: _s, ...payload } = parseCanonical(text).value;
+  return sha256Hex(Buffer.from(canonicalize(payload), 'utf8'));
+}
 
-  // 2a. 末端浮标未获上游允许（第 0 跳允许 buoy-01/02，末端命令仅允许 buoy-01，
+function sectionSetAuthorization() {
+  console.log('\n[2/7] 乱序委托集合授权求解复核');
+  const root = generateKeyPair();
+  const a = generateKeyPair();
+  const b = generateKeyPair();
+  const t = generateKeyPair();
+  const rootKeyText = rootKeyDocument(root.publicJwk);
+  const targetKeyText = rootKeyDocument(t.publicJwk);
+
+  // 两条可行路径：root->a->t（宽，仅 buoy-01）与 root->b->t（窄，含 buoy-02）；
+  // 另有回环 a->b、b->a 与一份篡改委托。
+  const dRa = issueDelegation({
+    iss: root.publicJwk, sub: a.publicJwk,
+    nbf: NOW - 3600, exp: NOW + 3600, aud: ['buoy-01', 'buoy-02'], maxSamples: 100,
+  }, root.privateJwk);
+  const dAt = issueDelegation({
+    iss: a.publicJwk, sub: t.publicJwk,
+    nbf: NOW - 1800, exp: NOW + 1800, aud: ['buoy-01'], maxSamples: 80,
+  }, a.privateJwk);
+  const dRb = issueDelegation({
+    iss: root.publicJwk, sub: b.publicJwk,
+    nbf: NOW - 3600, exp: NOW + 3600, aud: ['buoy-01', 'buoy-02'], maxSamples: 100,
+  }, root.privateJwk);
+  const dBt = issueDelegation({
+    iss: b.publicJwk, sub: t.publicJwk,
+    nbf: NOW - 1800, exp: NOW + 1800, aud: ['buoy-01', 'buoy-02'], maxSamples: 10,
+  }, b.privateJwk);
+  const dAb = issueDelegation({
+    iss: a.publicJwk, sub: b.publicJwk,
+    nbf: NOW - 900, exp: NOW + 900, aud: ['buoy-01'], maxSamples: 50,
+  }, a.privateJwk);
+  const dBa = issueDelegation({
+    iss: b.publicJwk, sub: a.publicJwk,
+    nbf: NOW - 800, exp: NOW + 800, aud: ['buoy-01'], maxSamples: 40,
+  }, b.privateJwk);
+  const tampered = (() => {
+    const v = parseCanonical(dRb, { requireOrderedKeys: false }).value;
+    v.maxSamples = 999; // 改写已签名内容但不重签
+    return canonicalize(v);
+  })();
+
+  const ask = (objects, buoy, samples, target = targetKeyText) => authorizeSet({
+    rootKeyText, objectTexts: objects, targetKeyText: target, buoy, samples, now: NOW,
+  });
+
+  // 2a. 乱序 + 回环 + 篡改委托共存：buoy-02/10 只能经 root->b->t（2 跳）
+  const objects = [dBa, tampered, dBt, dAb, dAt, dRb, dRa];
+  const r1 = ask(objects, 'buoy-02', 10);
+  check('乱序集合含回环与篡改委托：命中 root->b->t 两跳路径',
+    r1.ok && r1.evidence.hops.length === 2
+    && r1.evidence.pathDigests[0] === digestOfText(dRb)
+    && r1.evidence.pathDigests[1] === digestOfText(dBt),
+    r1.ok ? '' : JSON.stringify(r1.error));
+  if (r1.ok) {
+    check('路径逐跳收紧证据：末端有效约束 = 最后一跳委托约束',
+      JSON.stringify(r1.evidence.finalConstraints)
+      === JSON.stringify(r1.evidence.hops[1].tightened));
+    check('证据携带目标主体指纹与准许结论',
+      r1.evidence.targetThumbprint.length === 64
+      && r1.evidence.verdict.allow === true && r1.evidence.verdict.buoy === 'buoy-02');
+  }
+
+  // 2b. 确定性：相同集合与查询条件、不同粘贴顺序 → 同一条证据路径
+  const shuffled = [dRa, dRb, dAt, dBt, dAb, dBa, tampered];
+  const r2 = ask(shuffled, 'buoy-02', 10);
+  check('重复核验与粘贴顺序无关：同一证据路径',
+    r2.ok && JSON.stringify(r2.evidence) === JSON.stringify(r1.evidence));
+
+  // 2c. 同跳数按规范载荷摘要序列字典序选路（buoy-01/10 有两条 2 跳路径）
+  const r3 = ask([dAt, dBt, dRb, dRa], 'buoy-01', 10);
+  const pA = [digestOfText(dRa), digestOfText(dAt)];
+  const pB = [digestOfText(dRb), digestOfText(dBt)];
+  const want = JSON.stringify(pA) <= JSON.stringify(pB) ? pA : pB;
+  check('同跳数按摘要序列稳定选路',
+    r3.ok && JSON.stringify(r3.evidence.pathDigests) === JSON.stringify(want),
+    r3.ok ? `实际=${JSON.stringify(r3.evidence.pathDigests)}` : JSON.stringify(r3.error));
+
+  // 2d. 支配：到达同一主体的较窄状态不能替代较宽状态接续委托
+  //     （root->b->t 上限 10；请求 50 次只能经 root->a->t 上限 80）
+  const r4 = ask([dRa, dAt, dRb, dBt], 'buoy-01', 50);
+  check('采样量 50 越过窄路径上限：选中 root->a->t（宽状态可接续）',
+    r4.ok && r4.evidence.pathDigests[0] === digestOfText(dRa)
+    && r4.evidence.pathDigests[1] === digestOfText(dAt),
+    r4.ok ? '' : JSON.stringify(r4.error));
+
+  // 2e. 目标不可达：报告已到达主体与最先被拒委托及限制字段
+  const orphan = generateKeyPair();
+  const r5 = ask([dRa, dAt, tampered], 'buoy-01', 10, rootKeyDocument(orphan.publicJwk));
+  check('目标不可达 → NO_AUTHORIZING_PATH',
+    !r5.ok && r5.error.code === 'NO_AUTHORIZING_PATH');
+  if (!r5.ok && r5.reachability) {
+    check('不可达报告含已到达主体（根 0 跳起）',
+      r5.reachability.reached.length >= 2
+      && r5.reachability.reached[0].hops === 0
+      && r5.reachability.reached[0].constraints === null);
+    check('篡改委托列入最先被拒（BAD_SIGNATURE，字段 $["sig"]）',
+      r5.reachability.rejections.some((x) => x.code === 'BAD_SIGNATURE'
+        && x.field === '$["sig"]' && x.payloadDigest === digestOfText(tampered)));
+  }
+
+  // 2f. 过期委托列入被拒并定位限制字段
+  const dOld = issueDelegation({
+    iss: root.publicJwk, sub: t.publicJwk,
+    nbf: NOW - 5000, exp: NOW - 4000, aud: ['buoy-01'], maxSamples: 100,
+  }, root.privateJwk);
+  const r6 = ask([dOld], 'buoy-01', 1);
+  check('过期委托不可达且列入被拒（TIME_EXPIRED，字段 $["exp"]）',
+    !r6.ok && r6.error.code === 'NO_AUTHORIZING_PATH'
+    && r6.reachability.rejections.length === 1
+    && r6.reachability.rejections[0].code === 'TIME_EXPIRED'
+    && r6.reachability.rejections[0].field === '$["exp"]');
+
+  // 2g. 集合中混入 command / 非规范文本 → 与链式核验同形的输入错误
+  const r7 = ask(['{"typ":"delegation","aud":["x"]}'], 'buoy-01', 1);
+  check('非规范委托文本被拒绝并定位（KEY_ORDER, hop=0）',
+    !r7.ok && r7.error.code === 'KEY_ORDER' && r7.error.hop === 0);
+}
+
+
+// ---------- 3) 越权链 ----------
+function sectionOverPrivileged() {
+  console.log('\n[3/7] 越权链拒绝复核');
+
+  // 3a. 末端浮标未获上游允许（第 0 跳允许 buoy-01/02，末端命令仅允许 buoy-01，
   //     命令请求 buoy-02 → 首个限制跳为末端 hop=1）
   let c = buildValidChain({ now: NOW, buoys: ['buoy-01', 'buoy-02'], maxSamples: 100, samples: 5 });
   let v = parseCanonical(c.objectTexts[1], { requireOrderedKeys: false }).value;
@@ -129,14 +256,14 @@ function sectionOverPrivileged() {
   c.objectTexts[1] = resign(v, c.mid.privateJwk);
   expectReject('末端浮标未获全部上游允许', c, 'BUOY_NOT_ALLOWED', 1, '$["aud"]');
 
-  // 2b. 采样量超过最严上限（命令上限 50，请求 51）
+  // 3b. 采样量超过最严上限（命令上限 50，请求 51）
   c = buildValidChain({ now: NOW });
   v = parseCanonical(c.objectTexts[1], { requireOrderedKeys: false }).value;
   v.samples = 51;
   c.objectTexts[1] = resign(v, c.mid.privateJwk);
   expectReject('采样量超过任一跳上限', c, 'SAMPLES_EXCEEDED', 1, '$["maxSamples"]');
 
-  // 2c. 中间委托放宽浮标集合
+  // 3c. 中间委托放宽浮标集合
   c = buildValidChain({ now: NOW, buoys: ['buoy-01'] });
   const widened = issueDelegation({
     iss: c.mid.publicJwk, sub: c.mid.publicJwk,
@@ -146,7 +273,7 @@ function sectionOverPrivileged() {
   c.objectTexts.splice(1, 0, widened);
   expectReject('浮标集合被放宽', c, 'NOT_TIGHTENED', 1, '$["aud"]');
 
-  // 2d. 时间窗放宽（exp 延后）
+  // 3d. 时间窗放宽（exp 延后）
   const root = generateKeyPair();
   const a = generateKeyPair();
   const d1 = issueDelegation({
@@ -162,12 +289,12 @@ function sectionOverPrivileged() {
     rootKeyText: rootKeyDocument(root.publicJwk), objectTexts: [d1, cmdLate], now: NOW,
   }, 'NOT_TIGHTENED', 1, '$["exp"]');
 
-  // 2e. 链首签发者不是所粘贴根公钥
+  // 3e. 链首签发者不是所粘贴根公钥
   c = buildValidChain({ now: NOW });
   c.rootKeyText = rootKeyDocument(generateKeyPair().publicJwk);
   expectReject('链首签发者不等于根公钥', c, 'ISSUER_NOT_ROOT', 0, '$["iss"]');
 
-  // 2f. 委托并非前一主体签发（iss 与签名密钥同时被替换）
+  // 3f. 委托并非前一主体签发（iss 与签名密钥同时被替换）
   const root2 = generateKeyPair();
   const good = generateKeyPair();
   const mallory = generateKeyPair();
@@ -189,9 +316,9 @@ function sectionOverPrivileged() {
   }, 'ISSUER_MISMATCH', 1, '$["iss"]');
 }
 
-// ---------- 3) 篡改签名 / 改写载荷 ----------
+// ---------- 4) 篡改签名 / 改写载荷 ----------
 function sectionTamper() {
-  console.log('\n[3/6] 篡改签名与改写载荷拒绝复核');
+  console.log('\n[4/7] 篡改签名与改写载荷拒绝复核');
 
   let c = buildValidChain({ now: NOW });
   let v = parseCanonical(c.objectTexts[0], { requireOrderedKeys: false }).value;
@@ -214,9 +341,9 @@ function sectionTamper() {
   expectReject('签名字段被直接篡改', c, 'BAD_SIGNATURE', 0);
 }
 
-// ---------- 4) 结构性 / 数值错误 ----------
+// ---------- 5) 结构性 / 数值错误 ----------
 function sectionStructural() {
-  console.log('\n[4/6] 结构性与数值错误定位复核');
+  console.log('\n[5/7] 结构性与数值错误定位复核');
   const cases = [
     { name: '重复键', code: 'DUPLICATE_KEY',
       mutate: (t) => t.replace('"maxSamples":100', '"maxSamples":100,"maxSamples":9') },
@@ -244,7 +371,7 @@ function sectionStructural() {
   }
 }
 
-// ---------- 5) 代码测试 / 页面检查 ----------
+// ---------- 6) 代码测试 / 页面检查 ----------
 function run(cmd, args, timeoutMs = 120000) {
   return new Promise((resolve) => {
     const child = spawn(cmd, args, { cwd: rootDir, stdio: ['ignore', 'pipe', 'pipe'] });
@@ -264,7 +391,7 @@ function run(cmd, args, timeoutMs = 120000) {
 }
 
 async function sectionTestsAndPage() {
-  console.log('\n[5/6] 代码测试与页面构建检查');
+  console.log('\n[6/7] 代码测试与页面构建检查');
   const t = await run(process.execPath, ['--test', '--test-concurrency=2', 'tests/']);
   const testCount = (t.out.match(/# tests (\d+)/) || [])[1];
   const passCount = (t.out.match(/# pass (\d+)/) || [])[1];
@@ -275,7 +402,7 @@ async function sectionTestsAndPage() {
   check('页面构建检查通过', pg.code === 0, pg.code === 0 ? '' : (pg.out + pg.err).trim());
 }
 
-// ---------- 6) HTTP 冒烟 ----------
+// ---------- 7) HTTP 冒烟 ----------
 function httpRequest(method, urlPath, { port, host = '127.0.0.1', body, baseUrl } = {}) {
   return new Promise((resolve, reject) => {
     const u = new URL(urlPath, baseUrl || `http://${host}:${port}`);
@@ -307,7 +434,7 @@ async function waitForHealth(port, tries = 60) {
 }
 
 async function smokeGateway(label, target) {
-  console.log(`\n[6/6] 健康地址 API/HTTP 冒烟（${label}）`);
+  console.log(`\n[7/7] 健康地址 API/HTTP 冒烟（${label}）`);
 
   const health = await httpRequest('GET', '/health', target);
   const healthJson = JSON.parse(health.body);
@@ -367,11 +494,75 @@ async function smokeGateway(label, target) {
 
   const badReq = await httpRequest('POST', '/api/verify', { ...target, body: 'not-json' });
   check('POST /api/verify 非法请求体 → 400 BAD_REQUEST', badReq.status === 400);
+
+  // ---- 乱序委托集合授权求解冒烟 ----
+  const t0 = Math.floor(Date.now() / 1000);
+  const sRoot = generateKeyPair();
+  const sA = generateKeyPair();
+  const sB = generateKeyPair();
+  const sT = generateKeyPair();
+  const sdRa = issueDelegation({
+    iss: sRoot.publicJwk, sub: sA.publicJwk,
+    nbf: t0 - 3600, exp: t0 + 3600, aud: ['buoy-01', 'buoy-02'], maxSamples: 100,
+  }, sRoot.privateJwk);
+  const sdAt = issueDelegation({
+    iss: sA.publicJwk, sub: sT.publicJwk,
+    nbf: t0 - 1800, exp: t0 + 1800, aud: ['buoy-01'], maxSamples: 80,
+  }, sA.privateJwk);
+  const sdRb = issueDelegation({
+    iss: sRoot.publicJwk, sub: sB.publicJwk,
+    nbf: t0 - 3600, exp: t0 + 3600, aud: ['buoy-01'], maxSamples: 100,
+  }, sRoot.privateJwk);
+  const sdBa = issueDelegation({ // 回环：b -> a
+    iss: sB.publicJwk, sub: sA.publicJwk,
+    nbf: t0 - 900, exp: t0 + 900, aud: ['buoy-01'], maxSamples: 40,
+  }, sB.privateJwk);
+  const authBody = {
+    rootKey: rootKeyDocument(sRoot.publicJwk),
+    objects: [sdBa, sdAt, sdRb, sdRa], // 乱序，含回环
+    targetKey: rootKeyDocument(sT.publicJwk),
+    buoy: 'buoy-01', samples: 10, now: t0,
+  };
+  const authResp = await httpRequest('POST', '/api/authorize', {
+    ...target, body: JSON.stringify(authBody),
+  });
+  const authJson = JSON.parse(authResp.body);
+  check('POST /api/authorize 乱序集合（含回环）→ 200，两跳路径与准许结论',
+    authResp.status === 200 && authJson.ok === true
+    && authJson.evidence.hops.length === 2 && authJson.evidence.verdict.allow === true,
+    `status=${authResp.status}`);
+
+  const authResp2 = await httpRequest('POST', '/api/authorize', {
+    ...target,
+    body: JSON.stringify({ ...authBody, objects: [sdRa, sdRb, sdAt, sdBa] }), // 换个粘贴顺序
+  });
+  const authJson2 = JSON.parse(authResp2.body);
+  check('POST /api/authorize 重复核验（换序）→ 同一证据路径',
+    authResp2.status === 200
+    && JSON.stringify(authJson2.evidence?.pathDigests) === JSON.stringify(authJson.evidence?.pathDigests),
+    `status=${authResp2.status}`);
+
+  const orphan = generateKeyPair();
+  const unResp = await httpRequest('POST', '/api/authorize', {
+    ...target,
+    body: JSON.stringify({ ...authBody, targetKey: rootKeyDocument(orphan.publicJwk) }),
+  });
+  const unJson = JSON.parse(unResp.body);
+  check('POST /api/authorize 目标不可达 → 422 NO_AUTHORIZING_PATH 且含已到达主体与被拒委托',
+    unResp.status === 422 && unJson.ok === false
+    && unJson.error.code === 'NO_AUTHORIZING_PATH'
+    && Array.isArray(unJson.reachability?.reached) && unJson.reachability.reached.length >= 1
+    && Array.isArray(unJson.reachability?.rejections),
+    `status=${unResp.status}`);
+
+  const badAuth = await httpRequest('POST', '/api/authorize', { ...target, body: 'not-json' });
+  check('POST /api/authorize 非法请求体 → 400 BAD_REQUEST', badAuth.status === 400);
 }
 
 async function main() {
   console.log('=== verify：受限委托链复核一次性验收 ===');
   sectionValidChain();
+  sectionSetAuthorization();
   sectionOverPrivileged();
   sectionTamper();
   sectionStructural();

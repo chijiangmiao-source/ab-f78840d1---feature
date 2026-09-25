@@ -9,12 +9,12 @@
 <body>
 <header>
   <h1>海洋观测浮标失联应急采样 · 受限委托链核验</h1>
-  <p class="sub">岸站离线签发链逐跳验签：粘贴根公钥与按顺序排列的委托 / 末端命令（每行一份规范 JSON 对象）</p>
+  <p class="sub">岸站离线签发链逐跳验签：粘贴根公钥与按顺序排列的委托 / 末端命令（每行一份规范 JSON 对象）；或在下方对乱序缓存的离线委托集合做授权路径求解</p>
 </header>
 
 <main>
   <section class="panel">
-    <h2>输入</h2>
+    <h2>单链逐跳核验（按顺序排列的委托链）</h2>
     <label for="rootKey">根公钥（P-256 JWK，规范 JSON）</label>
     <textarea id="rootKey" rows="2" spellcheck="false"
       placeholder='{"crv":"P-256","kty":"EC","x":"…","y":"…"}'></textarea>
@@ -51,10 +51,85 @@
     </table>
     <div id="finalConstraints"></div>
   </section>
+
+  <section class="panel">
+    <h2>集合授权核验（乱序缓存的离线委托）</h2>
+    <p class="hint">粘贴乱序委托集合与查询条件，求解目标主体能否经任意合法委托路径取得权限；
+      成功时按跳数再按规范载荷摘要序列稳定展示一条路径，不可达时展示已到达主体与最先被拒的委托。</p>
+    <label for="authRootKey">根公钥（P-256 JWK，规范 JSON）</label>
+    <textarea id="authRootKey" rows="2" spellcheck="false"
+      placeholder='{"crv":"P-256","kty":"EC","x":"…","y":"…"}'></textarea>
+
+    <label for="authObjects">委托集合（乱序，每行一份 delegation；可含回环与不可比约束）</label>
+    <textarea id="authObjects" rows="8" spellcheck="false"
+      placeholder='{"aud":[…],"exp":…,"iss":{…},"maxSamples":…,"nbf":…,"sig":"…","sub":{…},"typ":"delegation"}'></textarea>
+
+    <label for="targetKey">目标主体公钥（P-256 JWK，规范 JSON）</label>
+    <textarea id="targetKey" rows="2" spellcheck="false"
+      placeholder='{"crv":"P-256","kty":"EC","x":"…","y":"…"}'></textarea>
+
+    <div class="grid2">
+      <div>
+        <label for="buoy">目标浮标</label>
+        <input id="buoy" type="text" placeholder="例如 buoy-01">
+      </div>
+      <div>
+        <label for="samples">请求采样量</label>
+        <input id="samples" type="text" inputmode="numeric" placeholder="例如 10">
+      </div>
+    </div>
+
+    <label for="authNow">评估时刻（unix 秒，留空取服务器当前时间）</label>
+    <input id="authNow" type="text" inputmode="numeric" placeholder="例如 1790000000">
+
+    <div class="actions">
+      <button id="authorizeBtn" type="button">求解授权路径</button>
+      <button id="authClearBtn" type="button" class="ghost">清空</button>
+    </div>
+  </section>
+
+  <section class="panel" id="authErrorPanel" hidden>
+    <h2>集合核验拒绝原因（错误草稿，不覆盖有效证据）</h2>
+    <div id="authErrorBody" class="error"></div>
+  </section>
+
+  <section class="panel" id="reachPanel" hidden>
+    <h2>目标不可达：已到达主体与最先被拒的委托</h2>
+    <div id="reachSummary"></div>
+    <h3>已到达主体（含各自有效约束）</h3>
+    <table id="reachedTable">
+      <thead>
+        <tr><th>主体指纹</th><th>跳数</th><th>到达时的有效约束</th></tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+    <h3>从其出发最先被拒的委托与限制字段</h3>
+    <table id="rejectedTable">
+      <thead>
+        <tr><th>跳</th><th>出发主体指纹</th><th>委托规范载荷摘要</th><th>错误码</th><th>限制字段</th><th>说明</th></tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+  </section>
+
+  <section class="panel" id="authEvidencePanel" hidden>
+    <h2>授权路径证据与最终结论</h2>
+    <div id="authVerdict"></div>
+    <table id="authHopTable">
+      <thead>
+        <tr>
+          <th>跳</th><th>类型</th><th>签名（sig）</th><th>规范载荷摘要（SHA-256）</th>
+          <th>签发者指纹</th><th>主体指纹</th><th>收紧后的约束</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+    <div id="authFinalConstraints"></div>
+  </section>
 </main>
 
 <footer>
-  <p>规范：JCS (RFC 8785) 规范 JSON 字节 · ECDSA P-256/SHA-256（P1363）· 仅允许时间窗 / 浮标集合 / 采样上限收紧</p>
+  <p>规范：JCS (RFC 8785) 规范 JSON 字节 · ECDSA P-256/SHA-256（P1363）· 仅允许时间窗 / 浮标集合 / 采样上限收紧 · 集合授权在授权状态图上求解，仅以更宽约束支配较窄状态</p>
 </footer>
 
 <script src="/app.js"></script>

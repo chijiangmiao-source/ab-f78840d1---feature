@@ -54,6 +54,17 @@ async function main() {
   if (!css.includes('.panel') || !css.includes('.error')) fail('style.css 缺少关键样式');
   ok('页面关键元素与逻辑齐备（输入 / 错误草稿 / 证据留存）');
 
+  // 集合授权核验（乱序委托）面板
+  for (const id of ['authRootKey', 'authObjects', 'targetKey', 'buoy', 'samples', 'authNow',
+    'authorizeBtn', 'authErrorPanel', 'authEvidencePanel', 'authHopTable',
+    'reachPanel', 'reachedTable', 'rejectedTable']) {
+    if (!html.includes(`id="${id}"`)) fail(`index.html 缺少集合授权元素 #${id}`);
+  }
+  for (const token of ['/api/authorize', 'lastValidAuthEvidence', 'reachability']) {
+    if (!js.includes(token)) fail(`app.js 缺少集合授权逻辑：${token}`);
+  }
+  ok('集合授权面板齐备（乱序委托输入 / 不可达展示 / 证据留存）');
+
   // JS 语法检查（浏览器脚本仅做解析校验，不执行）
   try {
     execFileSync(process.execPath, ['--check', jsPath], { stdio: 'pipe' });
