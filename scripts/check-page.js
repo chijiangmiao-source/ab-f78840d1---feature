@@ -44,11 +44,13 @@ async function main() {
   }
   ok('HTML 引用资源声明完整');
 
-  // 关键 UI 元素
-  for (const id of ['rootKey', 'objects', 'verifyBtn', 'errorPanel', 'evidencePanel', 'hopTable']) {
+  // 关键 UI 元素（含委托图核验模式）
+  for (const id of ['rootKey', 'objects', 'targetKey', 'buoy', 'samples',
+    'verifyBtn', 'modeGraph', 'modeChain', 'errorPanel', 'evidencePanel',
+    'hopTable', 'reachedBlock']) {
     if (!html.includes(`id="${id}"`)) fail(`index.html 缺少元素 #${id}`);
   }
-  for (const token of ['fetch(', '/api/verify', 'lastValidEvidence']) {
+  for (const token of ['fetch(', '/api/verify', '/api/verify-graph', 'lastValidEvidence']) {
     if (!js.includes(token)) fail(`app.js 缺少关键逻辑：${token}`);
   }
   if (!css.includes('.panel') || !css.includes('.error')) fail('style.css 缺少关键样式');

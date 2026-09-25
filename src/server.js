@@ -12,6 +12,7 @@ import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { verifyChain } from './chain.js';
+import { verifyDelegationGraph } from './graph.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT || 8080);
@@ -104,6 +105,34 @@ export function createServer() {
         const result = verifyChain({
           rootKeyText: body.rootKey,
           objectTexts: body.objects,
+          now: body.now,
+        });
+        return sendJson(res, result.ok ? 200 : 422, result);
+      }
+      if (req.method === 'POST' && url.pathname === '/api/verify-graph') {
+        const text = await readBody(req);
+        let body;
+        try {
+          body = JSON.parse(text);
+        } catch {
+          return sendJson(res, 400, {
+            ok: false,
+            error: { code: 'BAD_REQUEST', hop: -1, field: null,
+              message: '请求体必须是 JSON：{rootKey, delegations:[...], targetKey, buoy, samples, now?}' },
+          });
+        }
+        if (typeof body !== 'object' || body === null || Array.isArray(body)) {
+          return sendJson(res, 400, {
+            ok: false,
+            error: { code: 'BAD_REQUEST', hop: -1, field: null, message: '请求体必须是 JSON 对象' },
+          });
+        }
+        const result = verifyDelegationGraph({
+          rootKeyText: body.rootKey,
+          delegationTexts: body.delegations,
+          targetKeyText: body.targetKey,
+          buoy: body.buoy,
+          samples: body.samples,
           now: body.now,
         });
         return sendJson(res, result.ok ? 200 : 422, result);

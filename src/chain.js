@@ -126,8 +126,10 @@ function validateAud(value, hop) {
   return value;
 }
 
-// 校验单个链对象的模式与整数边界；返回规范化字段
-function validateObjectSchema(parsed, index, total) {
+// 校验单个链对象的模式与整数边界；返回规范化字段。
+// options.requireDelegationOnly 为 true 时（授权图模式），command 一律拒绝：
+// 乱序委托集合只接受 delegation；含 command 的核验走旧的单链接口。
+function validateObjectSchema(parsed, index, total, options = {}) {
   const hop = index;
   const obj = parsed.value;
   const numbers = parsed.numbers;
@@ -138,8 +140,10 @@ function validateObjectSchema(parsed, index, total) {
   if (typ !== 'delegation' && typ !== 'command') {
     throw new ChainError('SCHEMA', hop, '$["typ"]', 'typ 必须是 "delegation" 或 "command"');
   }
-  if (typ === 'command' && index !== total - 1) {
-    throw new ChainError('SCHEMA', hop, '$["typ"]', 'command 对象只能位于链末端');
+  if (typ === 'command' && (options.requireDelegationOnly || index !== total - 1)) {
+    throw new ChainError('SCHEMA', hop, '$["typ"]', options.requireDelegationOnly
+      ? '委托集合（授权图核验）仅接受 typ="delegation"；含 command 末端请使用单链核验接口'
+      : 'command 对象只能位于链末端');
   }
   const required = ['aud', 'exp', 'iss', 'maxSamples', 'nbf', 'sig', 'sub', 'typ'];
   if (typ === 'command') required.push('buoy', 'samples');
@@ -409,7 +413,13 @@ export {
   b64urlEncode,
   b64urlDecode,
   jwkThumbprint,
+  jwkEquals,
+  importJwk,
+  validateJwk,
+  validateObjectSchema,
   sha256Hex,
+  ChainError,
   LIMITS,
   MAX_CHAIN_LEN,
+  MAX_OBJECT_BYTES,
 };

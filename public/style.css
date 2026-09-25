@@ -36,6 +36,11 @@ textarea, input[type=text] {
 }
 textarea:focus, input:focus { outline: none; border-color: #3b82f6; }
 .actions { margin-top: 14px; display: flex; gap: 10px; }
+.modes { display: flex; gap: 10px; flex-wrap: wrap; }
+.mode { padding: 7px 16px; font-size: 13px; }
+.mode.active { background: #2563eb; color: #fff; border: 0; }
+.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 0 18px; margin-top: 4px; }
+@media (max-width: 820px) { .grid2 { grid-template-columns: 1fr; } }
 button {
   background: #2563eb;
   color: #fff;

@@ -17,6 +17,7 @@ import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import crypto from 'node:crypto';
 import { verifyChain } from '../src/chain.js';
+import { verifyDelegationGraph } from '../src/graph.js';
 import { canonicalize, parseCanonical } from '../src/canonical.js';
 import {
   generateKeyPair,
@@ -66,7 +67,7 @@ function resign(value, privateJwk) {
 
 // ---------- 1) 合法链逐跳证据 ----------
 function sectionValidChain() {
-  console.log('\n[1/6] 合法链逐跳证据复核');
+  console.log('\n[1/7] 合法链逐跳证据复核');
   const root = generateKeyPair();
   const a = generateKeyPair();
   const b = generateKeyPair();
@@ -119,7 +120,7 @@ function sectionValidChain() {
 
 // ---------- 2) 越权链 ----------
 function sectionOverPrivileged() {
-  console.log('\n[2/6] 越权链拒绝复核');
+  console.log('\n[2/7] 越权链拒绝复核');
 
   // 2a. 末端浮标未获上游允许（第 0 跳允许 buoy-01/02，末端命令仅允许 buoy-01，
   //     命令请求 buoy-02 → 首个限制跳为末端 hop=1）
@@ -191,7 +192,7 @@ function sectionOverPrivileged() {
 
 // ---------- 3) 篡改签名 / 改写载荷 ----------
 function sectionTamper() {
-  console.log('\n[3/6] 篡改签名与改写载荷拒绝复核');
+  console.log('\n[3/7] 篡改签名与改写载荷拒绝复核');
 
   let c = buildValidChain({ now: NOW });
   let v = parseCanonical(c.objectTexts[0], { requireOrderedKeys: false }).value;
@@ -216,7 +217,7 @@ function sectionTamper() {
 
 // ---------- 4) 结构性 / 数值错误 ----------
 function sectionStructural() {
-  console.log('\n[4/6] 结构性与数值错误定位复核');
+  console.log('\n[4/7] 结构性与数值错误定位复核');
   const cases = [
     { name: '重复键', code: 'DUPLICATE_KEY',
       mutate: (t) => t.replace('"maxSamples":100', '"maxSamples":100,"maxSamples":9') },
@@ -244,7 +245,145 @@ function sectionStructural() {
   }
 }
 
-// ---------- 5) 代码测试 / 页面检查 ----------
+// ---------- 5) 乱序委托集合 / 回环 授权状态图 ----------
+function graphFixture() {
+  const root = generateKeyPair();
+  const a = generateKeyPair();
+  const b = generateKeyPair();
+  const t = generateKeyPair();
+  const d = (iss, sub, patch = {}) => issueDelegation({
+    iss: iss.publicJwk, sub: sub.publicJwk,
+    nbf: NOW - 3600, exp: NOW + 3600,
+    aud: ['buoy-01', 'buoy-02'], maxSamples: 100, ...patch,
+  }, iss.privateJwk);
+  const e1 = d(root, a, {});
+  const e2 = d(root, b, { aud: ['buoy-01'], maxSamples: 10 });
+  const e3 = d(a, t, { aud: ['buoy-01'], maxSamples: 50, nbf: NOW - 1800, exp: NOW + 1800 });
+  const e4 = d(b, t, { aud: ['buoy-01'], maxSamples: 5 });
+  const loop = d(a, a, { aud: ['buoy-01', 'buoy-02'], maxSamples: 90 });
+  return {
+    root, a, b, t, edges: { e1, e2, e3, e4, loop },
+    base: {
+      rootKeyText: rootKeyDocument(root.publicJwk),
+      targetKeyText: rootKeyDocument(t.publicJwk),
+      now: NOW,
+    },
+  };
+}
+
+function payloadDigestOf(text) {
+  const v = parseCanonical(text).value;
+  delete v.sig;
+  return crypto.createHash('sha256').update(canonicalize(v), 'utf8').digest('hex');
+}
+
+function expectGraphReject(name, input, code) {
+  const r = verifyDelegationGraph(input);
+  const good = !r.ok && r.error.code === code;
+  check(`${name}（code=${code}）`, good,
+    good ? '' : `实际=${JSON.stringify(r.ok ? r.evidence.verdict : r.error)}`);
+  return r;
+}
+
+function sectionGraph() {
+  console.log('\n[5/7] 乱序委托集合与回环授权图复核');
+
+  const g = graphFixture();
+  const { e1, e2, e3, e4, loop } = g.edges;
+
+  // 5a. 乱序 + 重复 + 自环：选跳数最短且约束足够的路径
+  const r1 = verifyDelegationGraph({
+    ...g.base, delegationTexts: [e4, loop, e1, e3, e2, e1],
+    buoy: 'buoy-01', samples: 20,
+  });
+  check('乱序集合（含重复行与自环）准许且为 2 跳最短路径',
+    r1.ok && r1.evidence.hops.length === 2,
+    r1.ok ? `hops=${r1.evidence.hops.length}` : JSON.stringify(r1.error));
+  if (r1.ok) {
+    check('选中 root->a->t（cap50）而非窄路径 root->b->t（cap5）',
+      JSON.stringify(r1.evidence.hops.map((h) => h.payloadDigest))
+        === JSON.stringify([payloadDigestOf(e1), payloadDigestOf(e3)]));
+    check('逐跳收紧证据：上限 100 -> 50，浮标交集为 [buoy-01]',
+      r1.evidence.hops[0].tightened.maxSamples === 100
+      && r1.evidence.hops[1].tightened.maxSamples === 50
+      && JSON.stringify(r1.evidence.finalConstraints.aud) === '["buoy-01"]');
+  }
+
+  // 5b. 确定性：打乱顺序 + 重复核验得到同一条证据路径
+  const r2 = verifyDelegationGraph({
+    ...g.base, delegationTexts: [e2, e4, e1, e3, loop],
+    buoy: 'buoy-01', samples: 20,
+  });
+  const sig = (r) => JSON.stringify(r.evidence.hops.map((h) => [h.signature, h.payloadDigest]));
+  check('相同委托集合与查询条件重复核验得到同一条证据路径（与粘贴顺序无关）',
+    r2.ok && sig(r2) === sig(r1) && sig(verifyDelegationGraph({
+      ...g.base, delegationTexts: [e4, e3, e2, e1], buoy: 'buoy-01', samples: 20,
+    })) === sig(r1));
+
+  // 5c. 只按主体名称合并状态会误拒的情形：samples=20 仅宽路径可达
+  const narrowOnly = verifyDelegationGraph({
+    ...g.base, delegationTexts: [e2, e4], buoy: 'buoy-01', samples: 20,
+  });
+  check('窄路径 root->b->t 无法承载 samples=20（SAMPLES_EXCEEDED）',
+    !narrowOnly.ok && narrowOnly.error.code === 'SAMPLES_EXCEEDED');
+
+  // 5d. 回环严格收紧：自环 cap100->90 产生更窄状态；全等环被剪枝收敛
+  const root2 = generateKeyPair();
+  const aa = generateKeyPair();
+  const bb = generateKeyPair();
+  const tt = generateKeyPair();
+  const d = (iss, sub, patch = {}) => issueDelegation({
+    iss: iss.publicJwk, sub: sub.publicJwk,
+    nbf: NOW - 3600, exp: NOW + 3600, aud: ['x'], maxSamples: 10, ...patch,
+  }, iss.privateJwk);
+  const f1 = d(root2, aa, {});
+  const f2 = d(aa, bb, { maxSamples: 10 });
+  const f3 = d(bb, aa, { maxSamples: 10 }); // 全等回环 -> 剪枝
+  const loopRes = expectGraphReject('全等回环被剪枝且目标不可达时收敛返回（无环膨胀）', {
+    rootKeyText: rootKeyDocument(root2.publicJwk),
+    targetKeyText: rootKeyDocument(tt.publicJwk),
+    delegationTexts: [f1, f2, f3], buoy: 'x', samples: 1, now: NOW,
+  }, 'TARGET_UNREACHABLE');
+  check('回环不导致主体状态膨胀（到达主体数受界）',
+    !loopRes.ok && loopRes.unreachable.reached.length <= 3);
+
+  // 5e. 不可达诊断：已到达主体 + 最先被拒委托与限制字段
+  const x = generateKeyPair();
+  const bad = issueDelegation({
+    iss: g.a.publicJwk, sub: x.publicJwk,
+    nbf: NOW - 3600, exp: NOW + 7200, // 放宽 exp
+    aud: ['buoy-01'], maxSamples: 50,
+  }, g.a.privateJwk);
+  const rUn = expectGraphReject('放宽时间窗的续委托被拒、目标不可达', {
+    ...g.base, targetKeyText: rootKeyDocument(x.publicJwk),
+    delegationTexts: [e1, bad], buoy: 'buoy-01', samples: 1,
+  }, 'TARGET_UNREACHABLE');
+  const reachedA = rUn.unreachable?.reached?.find((z) => z.hops === 1);
+  check('诊断含已到达主体 a 及其最先被拒委托（NOT_TIGHTENED / $["exp"]）',
+    !!reachedA && reachedA.firstRejected
+      && reachedA.firstRejected.code === 'NOT_TIGHTENED'
+      && reachedA.firstRejected.field === '$["exp"]',
+    reachedA ? JSON.stringify(reachedA.firstRejected) : '缺少到达主体诊断');
+
+  // 5f. 浮标越权 / 采样超限（目标可达但这项权限不足）
+  expectGraphReject('目标可达但浮标越权：BUOY_NOT_ALLOWED', {
+    ...g.base, delegationTexts: [e1, e3], buoy: 'buoy-02', samples: 1,
+  }, 'BUOY_NOT_ALLOWED');
+  expectGraphReject('目标可达但采样超限：SAMPLES_EXCEEDED', {
+    ...g.base, delegationTexts: [e1, e3], buoy: 'buoy-01', samples: 51,
+  }, 'SAMPLES_EXCEEDED');
+
+  // 5g. 集合内任一委托签名无效：按粘贴份序定位
+  const v = parseCanonical(e2, { requireOrderedKeys: false }).value;
+  v.maxSamples = 9;
+  const tampered = canonicalize(v);
+  const rBad = expectGraphReject('集合内改写不重签的委托被 BAD_SIGNATURE 定位', {
+    ...g.base, delegationTexts: [e1, tampered, e3], buoy: 'buoy-01', samples: 1,
+  }, 'BAD_SIGNATURE');
+  check('BAD_SIGNATURE 定位到第 1 份', rBad.error.hop === 1, `hop=${rBad.error.hop}`);
+}
+
+// ---------- 6) 代码测试 / 页面检查 ----------
 function run(cmd, args, timeoutMs = 120000) {
   return new Promise((resolve) => {
     const child = spawn(cmd, args, { cwd: rootDir, stdio: ['ignore', 'pipe', 'pipe'] });
@@ -264,7 +403,7 @@ function run(cmd, args, timeoutMs = 120000) {
 }
 
 async function sectionTestsAndPage() {
-  console.log('\n[5/6] 代码测试与页面构建检查');
+  console.log('\n[6/7] 代码测试与页面构建检查');
   const t = await run(process.execPath, ['--test', '--test-concurrency=2', 'tests/']);
   const testCount = (t.out.match(/# tests (\d+)/) || [])[1];
   const passCount = (t.out.match(/# pass (\d+)/) || [])[1];
@@ -307,7 +446,7 @@ async function waitForHealth(port, tries = 60) {
 }
 
 async function smokeGateway(label, target) {
-  console.log(`\n[6/6] 健康地址 API/HTTP 冒烟（${label}）`);
+  console.log(`\n[7/7] 健康地址 API/HTTP 冒烟（${label}）`);
 
   const health = await httpRequest('GET', '/health', target);
   const healthJson = JSON.parse(health.body);
@@ -316,7 +455,7 @@ async function smokeGateway(label, target) {
 
   const home = await httpRequest('GET', '/', target);
   check('GET / → 200 且返回静态核验页面',
-    home.status === 200 && home.body.includes('受限委托链核验'));
+    home.status === 200 && home.body.includes('受限委托核验'));
 
   const valid = buildValidChain({ now: Math.floor(Date.now() / 1000) });
   const okResp = await httpRequest('POST', '/api/verify', {
@@ -367,6 +506,55 @@ async function smokeGateway(label, target) {
 
   const badReq = await httpRequest('POST', '/api/verify', { ...target, body: 'not-json' });
   check('POST /api/verify 非法请求体 → 400 BAD_REQUEST', badReq.status === 400);
+
+  // ---- 委托图核验端点：乱序集合准许 / 不可达诊断 ----
+  const gf = graphFixture();
+  const ge = gf.edges;
+  const graphOk = await httpRequest('POST', '/api/verify-graph', {
+    ...target,
+    body: JSON.stringify({
+      rootKey: gf.base.rootKeyText, targetKey: gf.base.targetKeyText,
+      delegations: [ge.e4, ge.loop, ge.e1, ge.e3, ge.e2, ge.e1], // 乱序 + 重复 + 自环
+      buoy: 'buoy-01', samples: 20, now: gf.base.now,
+    }),
+  });
+  const graphOkJson = JSON.parse(graphOk.body);
+  check('POST /api/verify-graph 乱序集合（含回环）→ 200 且为 2 跳最短证据路径',
+    graphOk.status === 200 && graphOkJson.ok === true
+    && graphOkJson.evidence.hops.length === 2
+    && graphOkJson.evidence.verdict.allow === true
+    && graphOkJson.evidence.finalConstraints.maxSamples === 50,
+    `status=${graphOk.status}`);
+
+  // 同集合换顺序再验一次：路径摘要一致
+  const graphOk2 = await httpRequest('POST', '/api/verify-graph', {
+    ...target,
+    body: JSON.stringify({
+      rootKey: gf.base.rootKeyText, targetKey: gf.base.targetKeyText,
+      delegations: [ge.e2, ge.e4, ge.e1, ge.e3],
+      buoy: 'buoy-01', samples: 20, now: gf.base.now,
+    }),
+  });
+  const graphOk2Json = JSON.parse(graphOk2.body);
+  const dgKey = (j) => JSON.stringify(j.evidence.hops.map((h) => h.payloadDigest));
+  check('POST /api/verify-graph 换序重复核验得到同一条证据路径',
+    graphOk2Json.ok === true && dgKey(graphOk2Json) === dgKey(graphOkJson));
+
+  const unknown = generateKeyPair();
+  const graphNo = await httpRequest('POST', '/api/verify-graph', {
+    ...target,
+    body: JSON.stringify({
+      rootKey: gf.base.rootKeyText, targetKey: rootKeyDocument(unknown.publicJwk),
+      delegations: [ge.e1], buoy: 'buoy-01', samples: 1, now: gf.base.now,
+    }),
+  });
+  const graphNoJson = JSON.parse(graphNo.body);
+  check('POST /api/verify-graph 目标不可达 → 422 TARGET_UNREACHABLE 且含已到达主体诊断',
+    graphNo.status === 422 && graphNoJson.ok === false
+    && graphNoJson.error.code === 'TARGET_UNREACHABLE'
+    && Array.isArray(graphNoJson.unreachable?.reached)
+    && graphNoJson.unreachable.reached.length >= 1,
+    `status=${graphNo.status}`);
 }
 
 async function main() {
@@ -375,6 +563,7 @@ async function main() {
   sectionOverPrivileged();
   sectionTamper();
   sectionStructural();
+  sectionGraph();
   await sectionTestsAndPage();
 
   const port = Number(process.env.VERIFY_PORT || 18080);

@@ -3,31 +3,53 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>浮标应急采样 · 受限委托链核验</title>
+<title>浮标应急采样 · 受限委托核验</title>
 <link rel="stylesheet" href="/style.css">
 </head>
 <body>
 <header>
-  <h1>海洋观测浮标失联应急采样 · 受限委托链核验</h1>
-  <p class="sub">岸站离线签发链逐跳验签：粘贴根公钥与按顺序排列的委托 / 末端命令（每行一份规范 JSON 对象）</p>
+  <h1>海洋观测浮标失联应急采样 · 受限委托核验</h1>
+  <p class="sub">岸站离线委托按 JCS（RFC 8785）规范 JSON 字节逐份验签：乱序委托集合的授权路径搜索，或按顺序排列的单链逐跳核验</p>
 </header>
 
 <main>
   <section class="panel">
-    <h2>输入</h2>
+    <h2>核验模式</h2>
+    <div class="modes" role="tablist">
+      <button type="button" id="modeGraph" class="mode active">委托图核验（乱序集合）</button>
+      <button type="button" id="modeChain" class="mode ghost">单链核验（旧接口）</button>
+    </div>
+  </section>
+
+  <!-- 委托图核验输入 -->
+  <section class="panel" id="graphPanel">
+    <h2>输入 · 授权状态图</h2>
     <label for="rootKey">根公钥（P-256 JWK，规范 JSON）</label>
     <textarea id="rootKey" rows="2" spellcheck="false"
       placeholder='{"crv":"P-256","kty":"EC","x":"…","y":"…"}'></textarea>
 
-    <label for="objects">委托链对象（按顺序，每行一份：委托…→ 末端命令）</label>
+    <label for="objects">委托集合（乱序缓存，每行一份 delegation 规范 JSON；顺序无关，自动去重）</label>
     <textarea id="objects" rows="10" spellcheck="false"
       placeholder='{"aud":[…],"exp":…,"iss":{…},"maxSamples":…,"nbf":…,"sig":"…","sub":{…},"typ":"delegation"}'></textarea>
 
-    <label for="now">评估时刻（unix 秒，留空取服务器当前时间）</label>
-    <input id="now" type="text" inputmode="numeric" placeholder="例如 1790000000">
+    <div class="grid2">
+      <div>
+        <label for="targetKey">目标主体公钥（P-256 JWK，规范 JSON）</label>
+        <textarea id="targetKey" rows="2" spellcheck="false"
+          placeholder='{"crv":"P-256","kty":"EC","x":"…","y":"…"}'></textarea>
+      </div>
+      <div>
+        <label for="now">评估时刻（unix 秒，留空取服务器当前时间）</label>
+        <input id="now" type="text" inputmode="numeric" placeholder="例如 1790000000">
+        <label for="buoy">目标浮标</label>
+        <input id="buoy" type="text" placeholder="例如 buoy-01">
+        <label for="samples">采样量</label>
+        <input id="samples" type="text" inputmode="numeric" placeholder="例如 10">
+      </div>
+    </div>
 
     <div class="actions">
-      <button id="verifyBtn" type="button">逐跳核验</button>
+      <button id="verifyBtn" type="button">搜索授权路径</button>
       <button id="clearBtn" type="button" class="ghost">清空</button>
     </div>
   </section>
@@ -38,7 +60,7 @@
   </section>
 
   <section class="panel" id="evidencePanel" hidden>
-    <h2>逐跳证据与最终结论</h2>
+    <h2>证据路径、逐跳收紧与最终结论</h2>
     <div id="verdict"></div>
     <table id="hopTable">
       <thead>
@@ -50,11 +72,12 @@
       <tbody></tbody>
     </table>
     <div id="finalConstraints"></div>
+    <div id="reachedBlock"></div>
   </section>
 </main>
 
 <footer>
-  <p>规范：JCS (RFC 8785) 规范 JSON 字节 · ECDSA P-256/SHA-256（P1363）· 仅允许时间窗 / 浮标集合 / 采样上限收紧</p>
+  <p>规范：JCS (RFC 8785) 规范 JSON 字节 · ECDSA P-256/SHA-256（P1363）· 约束状态图单调收紧传播 · 更宽约束支配较窄状态 · 仅允许时间窗 / 浮标集合 / 采样上限收紧</p>
 </footer>
 
 <script src="/app.js"></script>
